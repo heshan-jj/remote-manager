@@ -1,0 +1,59 @@
+name: Release HHJ Remote Manager
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Run Unit Tests
+        run: dotnet test HHJ.RemoteManager.sln -c Release
+
+      - name: Publish HHJ-Agent-Setup.exe
+        run: |
+          dotnet publish src/HHJ.Agent.Setup/HHJ.Agent.Setup.csproj `
+            -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true `
+            -o artifacts/publish/agent-setup
+
+      - name: Publish HHJ-Remote-Manager.exe
+        run: |
+          dotnet publish src/HHJ.RemoteManager.Desktop/HHJ.RemoteManager.Desktop.csproj `
+            -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true `
+            -o artifacts/publish/desktop
+
+      - name: Package Desktop Zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path `
+            artifacts/publish/desktop/HHJ-Remote-Manager.exe, `
+            artifacts/publish/desktop/Assets `
+            -DestinationPath artifacts/publish/HHJ-Remote-Manager-win-x64.zip -Force
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: HHJ Remote Manager ${{ inputs.tag || github.ref_name }}
+          files: |
+            artifacts/publish/agent-setup/HHJ-Agent-Setup.exe
+            artifacts/publish/desktop/HHJ-Remote-Manager.exe
+            artifacts/publish/HHJ-Remote-Manager-win-x64.zip
