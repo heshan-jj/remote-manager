@@ -1,8 +1,8 @@
 [package]
 name = "hhj-ssh-setup"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2021"
-description = "Simple, transparent Windows SSH + Tailscale setup CLI for authorized remote access"
+description = "Fast Windows OpenSSH + VPS reverse-tunnel service installer (~700 KB)"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -10,15 +10,13 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 base64 = "0.22"
-ureq = "2.12"
 chrono = { version = "0.4", features = ["clock"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
-    "Win32_Security_Cryptography",
-    "Win32_Security_WinTrust",
+    "Win32_System_Services",
     "Win32_System_Threading",
 ] }
 

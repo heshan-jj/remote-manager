@@ -1,47 +1,59 @@
 # `hhj-ssh-setup`
 
-A lightweight, pure-Rust Windows CLI installer (~2 MB) that sets up **Windows OpenSSH Server** (`sshd`) + **Tailscale** + **Tailscale-only Windows Firewall** + your **SSH public key**, then exits—so you can SSH into the target Windows PC with admin privileges from any terminal.
+A fast, zero-bloat Rust Windows installer that sets up **Windows OpenSSH Server** (`sshd`) + an auto-reconnecting **VPS reverse-tunnel Windows service** (`hhj-tunnel`) in seconds—no Tailscale, no GUI, no inbound firewall ports on the target PC.
 
-No custom daemon. No GUI bloat. No public IPv4 or router port forwarding required.
+## 1. One-Time VPS Setup (30 seconds)
 
-## Usage on the Target Windows PC (Run as Administrator)
+```bash
+sudo adduser --disabled-password --gecos "" --shell /usr/sbin/nologin hhj-tunnel
+sudo mkdir -p /home/hhj-tunnel/.ssh
+sudo touch /home/hhj-tunnel/.ssh/authorized_keys
+sudo chmod 700 /home/hhj-tunnel/.ssh && sudo chmod 600 /home/hhj-tunnel/.ssh/authorized_keys
+sudo chown -R hhj-tunnel:hhj-tunnel /home/hhj-tunnel/.ssh
 
-### Interactive setup (double-click or run with no arguments)
-```powershell
-.\hhj-ssh-setup.exe
+sudo tee /etc/ssh/sshd_config.d/99-hhj-tunnel.conf >/dev/null <<'EOF'
+Match User hhj-tunnel
+    AllowTcpForwarding remote
+    GatewayPorts no
+    X11Forwarding no
+    AllowAgentForwarding no
+    PermitTTY no
+    ClientAliveInterval 30
+    ClientAliveCountMax 3
+EOF
+sudo sshd -t && sudo systemctl reload ssh
 ```
+Generate one shared tunnel keypair once (`ssh-keygen -t ed25519 -N "" -f hhj_tunnel_key`) and add its `.pub` line to `/home/hhj-tunnel/.ssh/authorized_keys` prefixed with `restrict,port-forwarding `.
 
-### Non-interactive setup
+## 2. On the Target Windows PC (~3 seconds, Run as Administrator)
+
 ```powershell
-.\hhj-ssh-setup.exe install --yes --user <windows-username> --pubkey-file C:\path\to\id_ed25519.pub
+.\hhj-ssh-setup.exe install --yes `
+  --vps-host YOUR_VPS_IP `
+  --tunnel-key .\hhj_tunnel_key `
+  --user YOUR_WINDOWS_USER `
+  --pubkey-file .\your_admin_key.pub
 ```
+*(Or run `.\hhj-ssh-setup.exe` with no arguments for interactive prompts.)*
 
-### Other commands
+Other commands:
 ```powershell
 .\hhj-ssh-setup.exe status
 .\hhj-ssh-setup.exe revoke
 .\hhj-ssh-setup.exe disable
 ```
 
-## Connecting from Your Computer
-
-Connect from any terminal (Windows Terminal, PowerShell, Linux, macOS):
-```bash
-ssh <windows-username>@<tailscale-hostname-or-ip>
-```
-If `<windows-username>` is a Windows Administrator, your SSH session runs with full administrative privileges in PowerShell.
-
-## Building from Source
+## 3. Connect from Your Laptop
 
 ```bash
-cargo test
-cargo build --release --target x86_64-pc-windows-gnu
+ssh -J YOUR_VPS_USER@YOUR_VPS_IP YOUR_WINDOWS_USER@127.0.0.1 -p 2222
 ```
-
-## Docs
-
-- [architecture.md](docs/architecture.md)
-- [installation.md](docs/installation.md)
-- [networking.md](docs/networking.md)
-- [security.md](docs/security.md)
-- [troubleshooting.md](docs/troubleshooting.md)
+Or add to `~/.ssh/config`:
+```sshconfig
+Host target-pc
+    HostName 127.0.0.1
+    Port 2222
+    User YOUR_WINDOWS_USER
+    ProxyJump YOUR_VPS_USER@YOUR_VPS_IP
+```
+Then simply run `ssh target-pc`.

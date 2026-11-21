@@ -2,7 +2,7 @@ mod firewall;
 mod pubkey;
 mod sshd;
 mod state;
-mod tailscale;
+mod tunnel;
 mod win;
 
 use clap::{Parser, Subcommand};
@@ -12,15 +12,14 @@ use std::time::Duration;
 
 const SSHD_EXE: &str = r"C:\Windows\System32\OpenSSH\sshd.exe";
 const SSHD_CONFIG: &str = r"C:\ProgramData\ssh\sshd_config";
-const TAILSCALE_EXE: &str = r"C:\Program Files\Tailscale\tailscale.exe";
+const SSH_KEYSCAN_EXE: &str = r"C:\Windows\System32\OpenSSH\ssh-keyscan.exe";
 const ADMIN_AUTH_KEYS: &str = r"C:\ProgramData\ssh\administrators_authorized_keys";
-const DOWNLOADS_DIR: &str = r"C:\ProgramData\HHJ\AgentSetup\downloads";
 
 #[derive(Parser)]
 #[command(
     name = "hhj-ssh-setup",
     version,
-    about = "Simple Windows SSH + Tailscale service installer for authorized remote terminal access"
+    about = "Fast Windows OpenSSH + VPS reverse-tunnel service installer"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -29,38 +28,43 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Guided setup (default when run with no arguments)
+    /// Guided or one-shot setup (default when run with no arguments)
     Install {
-        /// Confirm ownership/authorization without interactive prompt
+        /// Confirm authorization without interactive prompts
         #[arg(long)]
         yes: bool,
-        /// OpenSSH public key line (or use --pubkey-file)
+        /// VPS hostname or public IP
+        #[arg(long)]
+        vps_host: Option<String>,
+        /// VPS SSH port (default: 22)
+        #[arg(long, default_value_t = 22)]
+        vps_port: u16,
+        /// Restricted VPS tunnel username (default: hhj-tunnel)
+        #[arg(long, default_value = "hhj-tunnel")]
+        vps_user: String,
+        /// Port on VPS 127.0.0.1 forwarded to this PC's SSH (default: 2222)
+        #[arg(long, default_value_t = 2222)]
+        remote_port: u16,
+        /// Path to the shared tunnel private key for hhj-tunnel@vps
+        #[arg(long)]
+        tunnel_key: Option<String>,
+        /// Your admin OpenSSH public key line (or use --pubkey-file)
         #[arg(long)]
         pubkey: Option<String>,
-        /// Path to a .pub file containing the OpenSSH public key
+        /// Path to your admin .pub key file
         #[arg(long)]
         pubkey_file: Option<String>,
         /// Target Windows username (defaults to current user)
         #[arg(long)]
         user: Option<String>,
-        /// Optional one-time Tailscale auth key (never logged)
-        #[arg(long)]
-        auth_key: Option<String>,
-        /// Optional Tailscale machine hostname
-        #[arg(long)]
-        hostname: Option<String>,
-        /// Keep PowerShell as default OpenSSH shell (default: true)
+        /// Disable broad Any-IP OpenSSH firewall rules if found
         #[arg(long, default_value_t = true)]
-        powershell_shell: bool,
+        harden_firewall: bool,
     },
-    /// Show current sshd, Tailscale, firewall, and authorized key status
+    /// Show sshd, hhj-tunnel service, and authorized key status
     Status,
-    /// Stop sshd, remove HHJ firewall rule, revoke HHJ SSH keys, and restore defaults
-    Disable {
-        /// Also log out of Tailscale
-        #[arg(long)]
-        logout_tailscale: bool,
-    },
+    /// Stop hhj-tunnel & sshd, remove service, revoke HHJ SSH keys, and restore defaults
+    Disable,
     /// Revoke HHJ-managed SSH keys (all or by SHA256 fingerprint)
     Revoke {
         #[arg(long)]
@@ -68,29 +72,77 @@ enum Commands {
         #[arg(long)]
         user: Option<String>,
     },
+    /// Internal entrypoint used by Windows Service Control Manager
+    #[command(hide = true)]
+    ServiceRun,
 }
 
 fn main() {
     let cli = Cli::parse();
     let res = match cli.command {
-        None => run_install(false, None, None, None, None, None, true),
+        None => run_install(InstallArgs::default()),
         Some(Commands::Install {
             yes,
+            vps_host,
+            vps_port,
+            vps_user,
+            remote_port,
+            tunnel_key,
             pubkey,
             pubkey_file,
             user,
-            auth_key,
-            hostname,
-            powershell_shell,
-        }) => run_install(yes, pubkey, pubkey_file, user, auth_key, hostname, powershell_shell),
+            harden_firewall,
+        }) => run_install(InstallArgs {
+            yes,
+            vps_host,
+            vps_port,
+            vps_user,
+            remote_port,
+            tunnel_key,
+            pubkey,
+            pubkey_file,
+            user,
+            harden_firewall,
+        }),
         Some(Commands::Status) => run_status(),
-        Some(Commands::Disable { logout_tailscale }) => run_disable(logout_tailscale),
+        Some(Commands::Disable) => run_disable(),
         Some(Commands::Revoke { fingerprint, user }) => run_revoke(fingerprint, user),
+        Some(Commands::ServiceRun) => tunnel::run_windows_service(),
     };
 
     if let Err(e) = res {
         eprintln!("\n[ERROR] {e}");
         std::process::exit(1);
+    }
+}
+
+struct InstallArgs {
+    yes: bool,
+    vps_host: Option<String>,
+    vps_port: u16,
+    vps_user: String,
+    remote_port: u16,
+    tunnel_key: Option<String>,
+    pubkey: Option<String>,
+    pubkey_file: Option<String>,
+    user: Option<String>,
+    harden_firewall: bool,
+}
+
+impl Default for InstallArgs {
+    fn default() -> Self {
+        Self {
+            yes: false,
+            vps_host: None,
+            vps_port: 22,
+            vps_user: "hhj-tunnel".into(),
+            remote_port: 2222,
+            tunnel_key: None,
+            pubkey: None,
+            pubkey_file: None,
+            user: None,
+            harden_firewall: true,
+        }
     }
 }
 
@@ -112,41 +164,27 @@ fn require_windows_admin() -> Result<(), String> {
     Ok(())
 }
 
-fn run_install(
-    yes: bool,
-    pubkey_arg: Option<String>,
-    pubkey_file: Option<String>,
-    user_arg: Option<String>,
-    auth_key: Option<String>,
-    hostname: Option<String>,
-    powershell_shell: bool,
-) -> Result<(), String> {
+fn run_install(args: InstallArgs) -> Result<(), String> {
     println!("============================================================");
-    println!("  HHJ SSH Setup — Windows OpenSSH + Tailscale Installer");
+    println!("  HHJ SSH Setup — Fast OpenSSH + VPS Reverse Tunnel");
     println!("============================================================");
-    println!("This tool configures native Windows services for authorized SSH access:");
-    println!("  1. Windows OpenSSH Server (sshd service, Automatic startup)");
-    println!("  2. Tailscale VPN (official signed MSI, unattended service)");
-    println!("  3. Your SSH public key (authorized_keys with strict Windows ACLs)");
-    println!("  4. Windows Defender Firewall (Tailscale-only rule on SSH port)");
-    println!("All components remain visible in Windows Services, Firewall, and Settings.\n");
 
     require_windows_admin()?;
 
-    if !yes {
-        let ans = prompt("Do you own or have explicit authorization to administer this PC? (yes/no): ")?;
+    if !args.yes {
+        let ans = prompt("Authorize enabling OpenSSH + VPS reverse tunnel on this PC? (yes/no): ")?;
         if !ans.eq_ignore_ascii_case("yes") {
-            return Err("Consent not granted. Exiting without making changes.".into());
+            return Err("Consent not granted. Exiting.".into());
         }
     }
 
     let state_path = Path::new(state::STATE_FILE);
     let mut st = state::SetupState::load(state_path);
 
-    // 1. OpenSSH Server
+    // 1. Windows OpenSSH Server
     println!("\n[1/4] Configuring Windows OpenSSH Server...");
     if !Path::new(SSHD_EXE).exists() {
-        println!("  Installing OpenSSH.Server capability (this may take a minute)...");
+        println!("  Installing OpenSSH.Server capability...");
         let cap_res = win::run_powershell(
             "$ErrorActionPreference='Stop'; \
              $c=(Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Select-Object -First 1).Name; \
@@ -176,115 +214,35 @@ fn run_install(
         return Err(format!("Failed to start sshd: {}", svc_res.stderr.trim()));
     }
 
-    if powershell_shell {
-        let prev = win::run_powershell(
-            "$p=(Get-ItemProperty 'HKLM:\\SOFTWARE\\OpenSSH' -Name DefaultShell -ErrorAction SilentlyContinue).DefaultShell; \
-             if($p){Write-Output $p}",
-        )?;
-        let prev_val = prev.stdout.trim().to_string();
-        if !st.default_shell_changed_by_hhj {
-            st.default_shell_previously_existed = !prev_val.is_empty();
-            st.default_shell_previous_value = if prev_val.is_empty() { None } else { Some(prev_val) };
-            st.default_shell_changed_by_hhj = true;
-        }
-        let set_shell = win::run_powershell(
-            "$ErrorActionPreference='Stop'; \
-             New-Item -Path 'HKLM:\\SOFTWARE\\OpenSSH' -Force | Out-Null; \
-             Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\OpenSSH' -Name DefaultShell -Value 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'",
-        )?;
-        if set_shell.code != 0 {
-            eprintln!("  [WARN] Could not set DefaultShell: {}", set_shell.stderr.trim());
-        }
+    // Set PowerShell as default OpenSSH shell
+    let prev = win::run_powershell(
+        "$p=(Get-ItemProperty 'HKLM:\\SOFTWARE\\OpenSSH' -Name DefaultShell -ErrorAction SilentlyContinue).DefaultShell; \
+         if($p){Write-Output $p}",
+    )?;
+    let prev_val = prev.stdout.trim().to_string();
+    if !st.default_shell_changed_by_hhj {
+        st.default_shell_previously_existed = !prev_val.is_empty();
+        st.default_shell_previous_value = if prev_val.is_empty() { None } else { Some(prev_val) };
+        st.default_shell_changed_by_hhj = true;
     }
+    let _ = win::run_powershell(
+        "New-Item -Path 'HKLM:\\SOFTWARE\\OpenSSH' -Force | Out-Null; \
+         Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\OpenSSH' -Name DefaultShell -Value 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'",
+    );
 
     let cfg_text = std::fs::read_to_string(SSHD_CONFIG).unwrap_or_default();
     let cfg = sshd::parse_sshd_config(&cfg_text);
-    let banner = sshd::probe_ssh_banner("127.0.0.1", cfg.port, Duration::from_secs(5))
+    let banner = sshd::probe_ssh_banner("127.0.0.1", cfg.port, Duration::from_secs(3))
         .unwrap_or_else(|| "(no banner)".into());
-    println!("  sshd running on port {} — banner: {}", cfg.port, banner);
+    println!("  sshd Running on port {} — {}", cfg.port, banner);
 
-    // 2. Tailscale
-    println!("\n[2/4] Configuring Tailscale...");
-    if !Path::new(TAILSCALE_EXE).exists() {
-        println!("  Downloading official Tailscale MSI...");
-        let msi_path = Path::new(DOWNLOADS_DIR).join("tailscale-setup-latest-amd64.msi");
-        win::download_file(tailscale::OFFICIAL_TAILSCALE_MSI_URL, &msi_path)?;
-
-        println!("  Verifying Authenticode signature...");
-        let signer = win::verify_authenticode_publisher(&msi_path, tailscale::EXPECTED_TAILSCALE_ORG)?;
-        println!("  Verified signature: {signer}");
-
-        println!("  Installing Tailscale (unattended mode)...");
-        let msi_str = msi_path.to_string_lossy().to_string();
-        let install_res = win::run_cmd(
-            "msiexec.exe",
-            &["/i", &msi_str, "/qn", "/norestart", "TS_UNATTENDEDMODE=always"],
-        )?;
-        if install_res.code != 0 && install_res.code != 3010 {
-            return Err(format!("Tailscale MSI failed with exit code {}.", install_res.code));
-        }
-        st.tailscale_installed_by_hhj = true;
-    }
-
-    let mut ts_status = query_tailscale_status();
-    if ts_status.as_ref().is_none_or(|s| s.backend_state != "Running") {
-        if let Some(ref h) = hostname {
-            if !tailscale::is_valid_tailscale_hostname(h) {
-                return Err("Hostname must be 1-63 lowercase letters, digits, or hyphens.".into());
-            }
-        }
-        let mut args = vec!["up", "--unattended", "--timeout=5s"];
-        let h_val;
-        if let Some(ref h) = hostname {
-            args.push("--hostname");
-            h_val = h.clone();
-            args.push(&h_val);
-        }
-        let ak_arg;
-        if let Some(ref ak) = auth_key {
-            ak_arg = format!("--auth-key={}", ak.trim());
-            args.push(&ak_arg);
-        }
-        let up_res = win::run_cmd(TAILSCALE_EXE, &args)?;
-        let combined = tailscale::mask_secret(&format!("{}\n{}", up_res.stdout, up_res.stderr), auth_key.as_deref());
-        if let Some(url) = tailscale::extract_auth_url(&combined) {
-            println!("\n  Open this URL in a browser to sign in to your tailnet:\n  {url}\n");
-        }
-        println!("  Waiting for Tailscale connection (up to 3 minutes)...");
-        for _ in 0..90 {
-            std::thread::sleep(Duration::from_secs(2));
-            ts_status = query_tailscale_status();
-            if ts_status.as_ref().is_some_and(|s| s.backend_state == "Running") {
-                break;
-            }
-        }
-    }
-
-    let ts = ts_status.ok_or_else(|| "Tailscale did not reach Running state.".to_string())?;
-    if ts.backend_state != "Running" {
-        return Err(format!("Tailscale is in state '{}'. Complete login and re-run.", ts.backend_state));
-    }
-    println!(
-        "  Connected to tailnet '{}' as {} ({})",
-        ts.tailnet_name.as_deref().unwrap_or("unknown"),
-        ts.logged_in_user.as_deref().unwrap_or("unknown"),
-        ts.self_dns_name.as_deref().unwrap_or_else(|| ts.self_ips.first().map(|s| s.as_str()).unwrap_or("no-ip"))
-    );
-    if !yes {
-        let ok = prompt("  Confirm this is your intended tailnet? (yes/no): ")?;
-        if !ok.eq_ignore_ascii_case("yes") {
-            let _ = win::run_cmd(TAILSCALE_EXE, &["logout"]);
-            return Err("Tailnet rejected; logged out of Tailscale.".into());
-        }
-    }
-
-    // 3. SSH Public Key
-    println!("\n[3/4] Authorizing SSH public key...");
-    let target_user = match user_arg {
+    // 2. Authorize your admin SSH public key
+    println!("\n[2/4] Authorizing your admin SSH public key...");
+    let target_user = match args.user {
         Some(u) => u,
         None => {
             let current = std::env::var("USERNAME").unwrap_or_else(|_| "Administrator".into());
-            if yes {
+            if args.yes {
                 current
             } else {
                 let entered = prompt(&format!("  Target Windows username [{current}]: "))?;
@@ -293,14 +251,13 @@ fn run_install(
         }
     };
 
-    let raw_key = match (pubkey_arg, pubkey_file) {
+    let raw_key = match (args.pubkey, args.pubkey_file) {
         (Some(k), _) => k,
         (None, Some(path)) => std::fs::read_to_string(&path)
             .map_err(|e| format!("Could not read '{path}': {e}"))?,
-        (None, None) => prompt("  Paste your OpenSSH public key (.pub, single line): ")?,
+        (None, None) => prompt("  Paste your admin OpenSSH public key (.pub): ")?,
     };
     let parsed_key = pubkey::parse_public_key(&raw_key)?;
-    println!("  Validated {} key (SHA256:{})", parsed_key.key_type, parsed_key.fingerprint_sha256);
 
     let is_admin = is_user_in_administrators(&target_user)?;
     let auth_keys_path = if is_admin {
@@ -315,53 +272,116 @@ fn run_install(
     let existing_keys = std::fs::read_to_string(&auth_keys_path).unwrap_or_default();
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let hhj_line = pubkey::format_hhj_line(&parsed_key, &today, "admin");
-    let (updated, added) = pubkey::merge_authorized_keys(&existing_keys, &hhj_line, &parsed_key);
-    if added || !auth_keys_path.exists() {
-        std::fs::write(&auth_keys_path, updated)
-            .map_err(|e| format!("Failed to write {}: {e}", auth_keys_path.display()))?;
-    }
+    let (updated, _) = pubkey::merge_authorized_keys(&existing_keys, &hhj_line, &parsed_key);
+    std::fs::write(&auth_keys_path, updated)
+        .map_err(|e| format!("Failed to write {}: {e}", auth_keys_path.display()))?;
     if is_admin {
-        win::apply_admin_authorized_keys_acl(&auth_keys_path)?;
+        win::apply_admin_only_acl(&auth_keys_path)?;
     } else {
         win::apply_user_authorized_keys_acl(&auth_keys_path, &target_user)?;
     }
-    if !st
-        .added_authorized_keys
-        .iter()
-        .any(|k| k.fingerprint_sha256 == parsed_key.fingerprint_sha256)
-    {
+    if !st.added_authorized_keys.iter().any(|k| k.fingerprint_sha256 == parsed_key.fingerprint_sha256) {
         st.added_authorized_keys.push(state::AddedKeyRecord {
             file_path: auth_keys_path.to_string_lossy().to_string(),
             fingerprint_sha256: parsed_key.fingerprint_sha256.clone(),
             username: target_user.clone(),
         });
     }
-    println!(
-        "  Authorized key at {} (admin={is_admin}, added={added})",
-        auth_keys_path.display()
-    );
+    println!("  Authorized SHA256:{} for {} (admin={is_admin})", parsed_key.fingerprint_sha256, target_user);
 
-    // 4. Firewall
-    println!("\n[4/4] Configuring Windows Defender Firewall (Tailscale-only)...");
-    let (existing_rules, ts_alias) = query_firewall_and_alias()?;
-    let plan = firewall::reconcile(&existing_rules, cfg.port, SSHD_EXE, ts_alias.as_deref());
-    if plan.action != firewall::RuleAction::NoChange {
-        let apply_res = win::run_powershell(&firewall::build_apply_script(&plan))?;
-        if apply_res.code != 0 {
-            return Err(format!("Firewall update failed: {}", apply_res.stderr.trim()));
-        }
-        st.firewall_rule_created_by_hhj = true;
+    // 3. Configure & start VPS reverse-tunnel Windows service (Option 1)
+    println!("\n[3/4] Installing '{}' Windows service...", tunnel::SERVICE_NAME);
+    let vps_host = match args.vps_host {
+        Some(h) => h,
+        None => prompt("  VPS IP or hostname: ")?,
+    };
+    if !tunnel::is_valid_host(&vps_host) {
+        return Err("Invalid VPS host.".into());
     }
-    println!("  Firewall rule '{}' -> {:?}", firewall::HHJ_RULE_NAME, plan.action);
+    if !tunnel::is_valid_unix_user(&args.vps_user) {
+        return Err("Invalid VPS username.".into());
+    }
 
-    for broad in &plan.broad_rules {
-        let disable = if yes {
-            true
-        } else {
-            let a = prompt(&format!("  [WARN] {}\n  Disable this broad rule? (yes/no) [yes]: ", broad.reason))?;
-            a.is_empty() || a.eq_ignore_ascii_case("yes")
-        };
-        if disable {
+    let tunnel_key_src = match args.tunnel_key {
+        Some(p) => p,
+        None => prompt("  Path to shared tunnel private key: ")?,
+    };
+    let tunnel_key_bytes = std::fs::read(&tunnel_key_src)
+        .map_err(|e| format!("Could not read tunnel key '{tunnel_key_src}': {e}"))?;
+
+    std::fs::create_dir_all(tunnel::INSTALL_DIR)
+        .map_err(|e| format!("Failed to create {}: {e}", tunnel::INSTALL_DIR))?;
+
+    // Pin VPS host key via ssh-keyscan
+    let port_str = args.vps_port.to_string();
+    let scan = win::run_cmd(SSH_KEYSCAN_EXE, &["-p", &port_str, &vps_host])?;
+    if scan.code != 0 || scan.stdout.trim().is_empty() {
+        return Err(format!(
+            "Could not scan SSH host key from {vps_host}:{}: {}",
+            args.vps_port,
+            scan.stderr.trim()
+        ));
+    }
+    std::fs::write(tunnel::KNOWN_HOSTS_PATH, &scan.stdout)
+        .map_err(|e| format!("Failed to write known_hosts: {e}"))?;
+
+    std::fs::write(tunnel::TUNNEL_KEY_PATH, tunnel_key_bytes)
+        .map_err(|e| format!("Failed to write tunnel_key: {e}"))?;
+    win::apply_admin_only_acl(Path::new(tunnel::TUNNEL_KEY_PATH))?;
+
+    let tcfg = tunnel::TunnelConfig {
+        vps_host: vps_host.clone(),
+        vps_port: args.vps_port,
+        vps_user: args.vps_user.clone(),
+        remote_port: args.remote_port,
+        local_ssh_port: cfg.port,
+    };
+    tcfg.save(Path::new(tunnel::TUNNEL_CONFIG_PATH))?;
+
+    // Copy current exe to ProgramData so deleting the downloaded exe won't break the service
+    let self_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    if !self_exe.eq(Path::new(tunnel::INSTALLED_EXE)) {
+        let _ = win::run_cmd("sc.exe", &["stop", tunnel::SERVICE_NAME]);
+        std::thread::sleep(Duration::from_millis(500));
+        std::fs::copy(&self_exe, tunnel::INSTALLED_EXE)
+            .map_err(|e| format!("Failed to copy exe to {}: {e}", tunnel::INSTALLED_EXE))?;
+    }
+
+    let bin_path = format!("\"{}\" service-run", tunnel::INSTALLED_EXE);
+    let _ = win::run_cmd("sc.exe", &["delete", tunnel::SERVICE_NAME]);
+    std::thread::sleep(Duration::from_millis(300));
+    let create_res = win::run_cmd(
+        "sc.exe",
+        &[
+            "create",
+            tunnel::SERVICE_NAME,
+            "binPath=",
+            &bin_path,
+            "start=",
+            "auto",
+            "DisplayName=",
+            "HHJ SSH Reverse Tunnel",
+        ],
+    )?;
+    if create_res.code != 0 {
+        return Err(format!("sc.exe create failed: {} {}", create_res.stdout, create_res.stderr));
+    }
+    let _ = win::run_cmd(
+        "sc.exe",
+        &["failure", tunnel::SERVICE_NAME, "reset=", "86400", "actions=", "restart/5000/restart/5000/restart/5000"],
+    );
+    let start_res = win::run_cmd("sc.exe", &["start", tunnel::SERVICE_NAME])?;
+    if start_res.code != 0 {
+        return Err(format!("sc.exe start failed: {} {}", start_res.stdout, start_res.stderr));
+    }
+    println!("  Service '{}' started (auto-start on boot).", tunnel::SERVICE_NAME);
+
+    // 4. Optional firewall hardening (disable broad Any-IP OpenSSH rules)
+    println!("\n[4/4] Checking Windows Firewall exposure...");
+    if args.harden_firewall {
+        let rules = query_inbound_allow_rules()?;
+        let plan = firewall::reconcile(&rules, cfg.port, SSHD_EXE, None);
+        for broad in &plan.broad_rules {
             let res = win::run_powershell(&firewall::build_disable_rule_script(&broad.name))?;
             if res.code == 0
                 && !st.disabled_firewall_rules.iter().any(|r| r.name.eq_ignore_ascii_case(&broad.name))
@@ -370,59 +390,48 @@ fn run_install(
                     name: broad.name.clone(),
                     was_enabled: true,
                 });
+                println!("  Disabled broad firewall rule '{}'.", broad.name);
             }
         }
     }
 
     st.save(state_path)?;
 
-    let connect_host = ts
-        .self_dns_name
-        .as_deref()
-        .or_else(|| ts.self_ips.first().map(|s| s.as_str()))
-        .unwrap_or("<tailscale-ip>");
-
     println!("\n============================================================");
-    println!("  Setup Complete!");
-    println!("  Connect from any terminal with:");
-    if cfg.port == 22 {
-        println!("    ssh {target_user}@{connect_host}");
-    } else {
-        println!("    ssh -p {} {target_user}@{connect_host}", cfg.port);
-    }
+    println!("  Done! Connect from any terminal with:");
+    println!("    ssh -J <your-vps-user>@{vps_host} {target_user}@127.0.0.1 -p {}", args.remote_port);
     println!("============================================================");
     Ok(())
 }
 
 fn run_status() -> Result<(), String> {
     let st = state::SetupState::load(Path::new(state::STATE_FILE));
-    let ts = query_tailscale_status();
-    let sshd_info = if cfg!(windows) {
-        win::run_powershell("(Get-Service -Name sshd -ErrorAction SilentlyContinue | Select-Object Status,StartType | ConvertTo-Json -Compress)")
-            .map(|r| r.stdout.trim().to_string())
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    println!("State file: {}", state::STATE_FILE);
-    println!("sshd: {}", if sshd_info.is_empty() { "unknown" } else { &sshd_info });
-    if let Some(t) = ts {
-        println!("Tailscale: {} ({:?})", t.backend_state, t.self_dns_name);
-    } else {
-        println!("Tailscale: not installed or not running");
+    if cfg!(windows) {
+        let out = win::run_powershell(
+            "Get-Service -Name sshd,hhj-tunnel -ErrorAction SilentlyContinue | Select-Object Name,Status,StartType | ConvertTo-Json -Compress",
+        )?;
+        println!("Services: {}", out.stdout.trim());
     }
-    println!("Managed keys recorded: {}", st.added_authorized_keys.len());
-    println!("Firewall rule managed: {}", st.firewall_rule_created_by_hhj);
+    if let Ok(tcfg) = tunnel::TunnelConfig::load(Path::new(tunnel::TUNNEL_CONFIG_PATH)) {
+        println!(
+            "Tunnel: {}@{}:{} -> 127.0.0.1:{} (local :{})",
+            tcfg.vps_user, tcfg.vps_host, tcfg.vps_port, tcfg.remote_port, tcfg.local_ssh_port
+        );
+    }
+    println!("Authorized keys recorded: {}", st.added_authorized_keys.len());
     Ok(())
 }
 
-fn run_disable(logout_tailscale: bool) -> Result<(), String> {
+fn run_disable() -> Result<(), String> {
     require_windows_admin()?;
     let state_path = Path::new(state::STATE_FILE);
     let mut st = state::SetupState::load(state_path);
 
-    let _ = win::run_powershell(&firewall::build_remove_hhj_rule_script());
-    st.firewall_rule_created_by_hhj = false;
+    let _ = win::run_cmd("sc.exe", &["stop", tunnel::SERVICE_NAME]);
+    let _ = win::run_cmd("sc.exe", &["delete", tunnel::SERVICE_NAME]);
+    let _ = std::fs::remove_file(tunnel::TUNNEL_KEY_PATH);
+    let _ = std::fs::remove_file(tunnel::KNOWN_HOSTS_PATH);
+    let _ = std::fs::remove_file(tunnel::TUNNEL_CONFIG_PATH);
 
     for r in st.disabled_firewall_rules.drain(..) {
         if r.was_enabled {
@@ -469,12 +478,8 @@ fn run_disable(logout_tailscale: bool) -> Result<(), String> {
         firewall::ps_literal(orig_start)
     ));
 
-    if logout_tailscale && Path::new(TAILSCALE_EXE).exists() {
-        let _ = win::run_cmd(TAILSCALE_EXE, &["logout"]);
-    }
-
     st.save(state_path)?;
-    println!("HHJ remote SSH access has been disabled and changes rolled back.");
+    println!("HHJ SSH + tunnel service disabled and cleaned up.");
     Ok(())
 }
 
@@ -499,14 +504,6 @@ fn run_revoke(fingerprint: Option<String>, user: Option<String>) -> Result<(), S
     Ok(())
 }
 
-fn query_tailscale_status() -> Option<tailscale::TailscaleStatus> {
-    if !Path::new(TAILSCALE_EXE).exists() {
-        return None;
-    }
-    let out = win::run_cmd(TAILSCALE_EXE, &["status", "--json"]).ok()?;
-    tailscale::parse_status_json(&out.stdout).ok()
-}
-
 fn is_user_in_administrators(username: &str) -> Result<bool, String> {
     let script = format!(
         "$u={}; $g=[ADSI]'WinNT://./Administrators,group'; \
@@ -518,37 +515,32 @@ fn is_user_in_administrators(username: &str) -> Result<bool, String> {
     Ok(res.stdout.trim().eq_ignore_ascii_case("true"))
 }
 
-fn query_firewall_and_alias() -> Result<(Vec<firewall::FirewallRuleSnapshot>, Option<String>), String> {
+fn query_inbound_allow_rules() -> Result<Vec<firewall::FirewallRuleSnapshot>, String> {
     let script = r#"
         $ErrorActionPreference='SilentlyContinue'
-        $rules = @(Get-NetFirewallRule -Direction Inbound -Action Allow | Where-Object { $_.Enabled -eq 'True' -or $_.DisplayName -like 'HHJ Remote Manager*' -or $_.DisplayName -like '*OpenSSH*' } | ForEach-Object {
+        @(Get-NetFirewallRule -Direction Inbound -Action Allow -Enabled True | Where-Object { $_.DisplayName -like '*OpenSSH*' } | ForEach-Object {
             $pf = $_ | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
             $af = $_ | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue
             $ap = $_ | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
-            $if = $_ | Get-NetFirewallInterfaceFilter -ErrorAction SilentlyContinue
             [ordered]@{
-                Name=$_.DisplayName; Enabled=($_.Enabled -eq 'True');
+                Name=$_.DisplayName; Enabled=$true;
                 Direction=[string]$_.Direction; Action=[string]$_.Action;
                 Protocol=[string]$pf.Protocol; LocalPort=[string]$pf.LocalPort;
                 RemoteAddress=(@($af.RemoteAddress) -join ',');
-                Program=[string]$ap.Program;
-                InterfaceAlias=(@($if.InterfaceAlias) -join ',')
+                Program=[string]$ap.Program
             }
-        })
-        $ts = (Get-NetAdapter | Where-Object { $_.InterfaceDescription -like 'Tailscale*' } | Select-Object -First 1).Name
-        [ordered]@{ rules=$rules; tsAlias=$ts } | ConvertTo-Json -Depth 4 -Compress
+        }) | ConvertTo-Json -Depth 4 -Compress
     "#;
     let res = win::run_powershell(script)?;
-    if res.code != 0 || res.stdout.trim().is_empty() {
-        return Ok((Vec::new(), None));
+    let trimmed = res.stdout.trim();
+    if res.code != 0 || trimmed.is_empty() {
+        return Ok(Vec::new());
     }
-    let val: serde_json::Value = serde_json::from_str(res.stdout.trim()).unwrap_or_default();
-    let alias = val.get("tsAlias").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let rules = val
-        .get("rules")
-        .and_then(|r| serde_json::from_value::<Vec<firewall::FirewallRuleSnapshot>>(r.clone()).ok())
-        .unwrap_or_default();
-    Ok((rules, alias))
+    if trimmed.starts_with('{') {
+        Ok(serde_json::from_str::<firewall::FirewallRuleSnapshot>(trimmed).into_iter().collect())
+    } else {
+        Ok(serde_json::from_str::<Vec<firewall::FirewallRuleSnapshot>>(trimmed).unwrap_or_default())
+    }
 }
 
 #[cfg(test)]
@@ -590,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn firewall_reconcile_detects_broad_rules_and_idempotency() {
+    fn firewall_reconcile_detects_broad_rules() {
         let broad = firewall::FirewallRuleSnapshot {
             name: "OpenSSH-Server-In-TCP".into(),
             enabled: true,
@@ -602,21 +594,22 @@ mod tests {
             program: Some(SSHD_EXE.into()),
             interface_alias: Some("Any".into()),
         };
-        let plan = firewall::reconcile(&[broad], 22, SSHD_EXE, Some("Tailscale"));
-        assert_eq!(plan.action, firewall::RuleAction::Create);
+        let plan = firewall::reconcile(&[broad], 22, SSHD_EXE, None);
         assert_eq!(plan.broad_rules.len(), 1);
     }
 
     #[test]
-    fn tailscale_json_and_masking() {
-        let json = r#"{"BackendState":"Running","Self":{"UserID":7,"DNSName":"pc.tail.ts.net.","TailscaleIPs":["100.64.0.5"]},"CurrentTailnet":{"Name":"heshan@x"},"User":{"7":{"LoginName":"heshan@x"}}}"#;
-        let st = tailscale::parse_status_json(json).unwrap();
-        assert_eq!(st.backend_state, "Running");
-        assert_eq!(st.self_dns_name.as_deref(), Some("pc.tail.ts.net"));
-        assert_eq!(st.logged_in_user.as_deref(), Some("heshan@x"));
-        assert_eq!(
-            tailscale::mask_secret("up --auth-key=tskey-123", Some("tskey-123")),
-            "up --auth-key=***REDACTED***"
-        );
+    fn tunnel_config_builds_strict_ssh_args() {
+        let cfg = tunnel::TunnelConfig {
+            vps_host: "203.0.113.10".into(),
+            vps_port: 22,
+            vps_user: "hhj-tunnel".into(),
+            remote_port: 2222,
+            local_ssh_port: 22,
+        };
+        let args = cfg.build_ssh_args();
+        assert!(args.contains(&"127.0.0.1:2222:127.0.0.1:22".to_string()));
+        assert!(args.contains(&"hhj-tunnel@203.0.113.10".to_string()));
+        assert!(args.contains(&"StrictHostKeyChecking=yes".to_string()));
     }
 }
