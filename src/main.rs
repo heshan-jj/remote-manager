@@ -323,22 +323,49 @@ fn run_install(args: InstallArgs) -> Result<(), String> {
     std::fs::create_dir_all(tunnel::INSTALL_DIR)
         .map_err(|e| format!("Failed to create {}: {e}", tunnel::INSTALL_DIR))?;
 
-    // Pin VPS host key via ssh-keyscan
-    let port_str = args.vps_port.to_string();
-    let scan = win::run_cmd(SSH_KEYSCAN_EXE, &["-p", &port_str, &vps_host])?;
-    if scan.code != 0 || scan.stdout.trim().is_empty() {
-        return Err(format!(
-            "Could not scan SSH host key from {vps_host}:{}: {}",
-            args.vps_port,
-            scan.stderr.trim()
-        ));
-    }
-    std::fs::write(tunnel::KNOWN_HOSTS_PATH, &scan.stdout)
-        .map_err(|e| format!("Failed to write known_hosts: {e}"))?;
-
     std::fs::write(tunnel::TUNNEL_KEY_PATH, tunnel_key_bytes)
         .map_err(|e| format!("Failed to write tunnel_key: {e}"))?;
     win::apply_admin_only_acl(Path::new(tunnel::TUNNEL_KEY_PATH))?;
+
+    // Pin VPS host key via ssh-keyscan, or fall back to ssh.exe (Windows OpenSSH 9.5 ssh-keyscan
+    // can fail on sntrup761x25519 KEX against Ubuntu 24.04 OpenSSH 9.6+).
+    let port_str = args.vps_port.to_string();
+    let scan = win::run_cmd(SSH_KEYSCAN_EXE, &["-p", &port_str, &vps_host])?;
+    if scan.code == 0 && !scan.stdout.trim().is_empty() {
+        std::fs::write(tunnel::KNOWN_HOSTS_PATH, &scan.stdout)
+            .map_err(|e| format!("Failed to write known_hosts: {e}"))?;
+    } else {
+        let _ = std::fs::remove_file(tunnel::KNOWN_HOSTS_PATH);
+        let kh_opt = format!("UserKnownHostsFile={}", tunnel::KNOWN_HOSTS_PATH);
+        let target = format!("{}@{}", args.vps_user, vps_host);
+        let _ = win::run_cmd(
+            tunnel::SSH_EXE,
+            &[
+                "-T",
+                "-i",
+                tunnel::TUNNEL_KEY_PATH,
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=8",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                &kh_opt,
+                "-p",
+                &port_str,
+                &target,
+            ],
+        );
+        let kh = std::fs::read_to_string(tunnel::KNOWN_HOSTS_PATH).unwrap_or_default();
+        if kh.trim().is_empty() {
+            return Err(format!(
+                "Could not obtain SSH host key from {vps_host}:{}: {}",
+                args.vps_port,
+                scan.stderr.trim()
+            ));
+        }
+    }
 
     let tcfg = tunnel::TunnelConfig {
         vps_host: vps_host.clone(),
