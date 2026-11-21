@@ -236,8 +236,8 @@ fn run_install(args: InstallArgs) -> Result<(), String> {
         .unwrap_or_else(|| "(no banner)".into());
     println!("  sshd Running on port {} — {}", cfg.port, banner);
 
-    // 2. Authorize your admin SSH public key
-    println!("\n[2/4] Authorizing your admin SSH public key...");
+    // 2. Optionally authorize admin SSH public key (if skipped, Windows password auth works)
+    println!("\n[2/4] Configuring SSH authentication...");
     let target_user = match args.user {
         Some(u) => u,
         None => {
@@ -251,43 +251,54 @@ fn run_install(args: InstallArgs) -> Result<(), String> {
         }
     };
 
-    let raw_key = match (args.pubkey, args.pubkey_file) {
-        (Some(k), _) => k,
-        (None, Some(path)) => std::fs::read_to_string(&path)
-            .map_err(|e| format!("Could not read '{path}': {e}"))?,
-        (None, None) => prompt("  Paste your admin OpenSSH public key (.pub): ")?,
+    let raw_key_opt = match (args.pubkey, args.pubkey_file) {
+        (Some(k), _) => Some(k),
+        (None, Some(path)) => Some(
+            std::fs::read_to_string(&path)
+                .map_err(|e| format!("Could not read '{path}': {e}"))?,
+        ),
+        (None, None) if args.yes => None,
+        (None, None) => {
+            let entered = prompt("  Admin OpenSSH public key (.pub, or Enter to use Windows password): ")?;
+            if entered.is_empty() { None } else { Some(entered) }
+        }
     };
-    let parsed_key = pubkey::parse_public_key(&raw_key)?;
 
-    let is_admin = is_user_in_administrators(&target_user)?;
-    let auth_keys_path = if is_admin {
-        Path::new(ADMIN_AUTH_KEYS).to_path_buf()
-    } else {
-        Path::new(r"C:\Users").join(&target_user).join(".ssh").join("authorized_keys")
-    };
-    if let Some(parent) = auth_keys_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create ssh dir: {e}"))?;
-    }
+    if let Some(raw_key) = raw_key_opt {
+        let parsed_key = pubkey::parse_public_key(&raw_key)?;
 
-    let existing_keys = std::fs::read_to_string(&auth_keys_path).unwrap_or_default();
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let hhj_line = pubkey::format_hhj_line(&parsed_key, &today, "admin");
-    let (updated, _) = pubkey::merge_authorized_keys(&existing_keys, &hhj_line, &parsed_key);
-    std::fs::write(&auth_keys_path, updated)
-        .map_err(|e| format!("Failed to write {}: {e}", auth_keys_path.display()))?;
-    if is_admin {
-        win::apply_admin_only_acl(&auth_keys_path)?;
+        let is_admin = is_user_in_administrators(&target_user)?;
+        let auth_keys_path = if is_admin {
+            Path::new(ADMIN_AUTH_KEYS).to_path_buf()
+        } else {
+            Path::new(r"C:\Users").join(&target_user).join(".ssh").join("authorized_keys")
+        };
+        if let Some(parent) = auth_keys_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create ssh dir: {e}"))?;
+        }
+
+        let existing_keys = std::fs::read_to_string(&auth_keys_path).unwrap_or_default();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let hhj_line = pubkey::format_hhj_line(&parsed_key, &today, "admin");
+        let (updated, _) = pubkey::merge_authorized_keys(&existing_keys, &hhj_line, &parsed_key);
+        std::fs::write(&auth_keys_path, updated)
+            .map_err(|e| format!("Failed to write {}: {e}", auth_keys_path.display()))?;
+        if is_admin {
+            win::apply_admin_only_acl(&auth_keys_path)?;
+        } else {
+            win::apply_user_authorized_keys_acl(&auth_keys_path, &target_user)?;
+        }
+        if !st.added_authorized_keys.iter().any(|k| k.fingerprint_sha256 == parsed_key.fingerprint_sha256) {
+            st.added_authorized_keys.push(state::AddedKeyRecord {
+                file_path: auth_keys_path.to_string_lossy().to_string(),
+                fingerprint_sha256: parsed_key.fingerprint_sha256.clone(),
+                username: target_user.clone(),
+            });
+        }
+        println!("  Authorized SHA256:{} for {} (admin={is_admin})", parsed_key.fingerprint_sha256, target_user);
     } else {
-        win::apply_user_authorized_keys_acl(&auth_keys_path, &target_user)?;
+        println!("  Using standard Windows password authentication for '{target_user}'.");
     }
-    if !st.added_authorized_keys.iter().any(|k| k.fingerprint_sha256 == parsed_key.fingerprint_sha256) {
-        st.added_authorized_keys.push(state::AddedKeyRecord {
-            file_path: auth_keys_path.to_string_lossy().to_string(),
-            fingerprint_sha256: parsed_key.fingerprint_sha256.clone(),
-            username: target_user.clone(),
-        });
-    }
-    println!("  Authorized SHA256:{} for {} (admin={is_admin})", parsed_key.fingerprint_sha256, target_user);
 
     // 3. Configure & start VPS reverse-tunnel Windows service (Option 1)
     println!("\n[3/4] Installing '{}' Windows service...", tunnel::SERVICE_NAME);
