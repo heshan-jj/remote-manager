@@ -48,6 +48,12 @@ jobs:
             artifacts/publish/desktop/Assets `
             -DestinationPath artifacts/publish/HHJ-Remote-Manager-win-x64.zip -Force
 
+      - name: Test & Build Rust CLI (hhj-ssh-setup.exe)
+        working-directory: rust/hhj-ssh-setup
+        run: |
+          cargo test
+          cargo build --release
+
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:
@@ -57,3 +63,4 @@ jobs:
             artifacts/publish/agent-setup/HHJ-Agent-Setup.exe
             artifacts/publish/desktop/HHJ-Remote-Manager.exe
             artifacts/publish/HHJ-Remote-Manager-win-x64.zip
+            rust/hhj-ssh-setup/target/release/hhj-ssh-setup.exe
