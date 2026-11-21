@@ -118,7 +118,7 @@ pub fn verify_authenticode_publisher(file_path: &Path, expected_org: &str) -> Re
         },
         dwStateAction: WTD_STATEACTION_VERIFY,
         hWVTStateData: std::ptr::null_mut(),
-        pwszURLReference: std::ptr::null(),
+        pwszURLReference: std::ptr::null_mut(),
         dwProvFlags: 0,
         dwUIContext: 0,
         pSignatureSettings: std::ptr::null_mut(),
